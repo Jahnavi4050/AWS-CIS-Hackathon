@@ -1,0 +1,817 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Combined CloudFormation template for EC2 instance with Nginx and PHP behind ALB, Lambda function, and CloudWatch monitoring with AIOps Investigation Group'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+    ConstraintDescription: Must be a valid EC2 instance type.
+    
+
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: Latest Amazon Linux 2 AMI from SSM Parameter Store
+
+  LogRetentionInDays:
+    Description: Number of days to retain logs
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  NotFoundErrorThreshold:
+    Description: Threshold for 404 error alarm
+    Type: Number
+    Default: 50.0
+
+  PhpErrorThreshold:
+    Description: Threshold for PHP error alarm
+    Type: Number
+    Default: 50.0
+
+
+
+Resources:
+  # CloudWatch Log Group - Created first to avoid circular dependencies
+  MyShinyNginxAppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: MyShinyNginxApp
+      RetentionInDays: !Ref LogRetentionInDays
+
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-IGW
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-PublicSubnet1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-PublicSubnet2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-PublicRouteTable
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # Security Groups
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access via port 80 and SSH access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # This resource will be different on every deployment
+  ReplacementTrigger:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: ReplacementTrigger
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      SubnetId: !Ref PublicSubnet1
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Force replacement with new timestamp: ${!AWS::StackName}-$(date +%s)-php-socket-fix
+          
+          # Update system packages
+          yum update -y
+          yum install -y aws-cfn-bootstrap
+          
+          # Enable and install nginx and PHP from Amazon Linux Extras
+          amazon-linux-extras enable nginx1
+          amazon-linux-extras enable php7.4
+          yum clean metadata
+          yum -y install nginx php php-fpm php-json php-common
+          
+          # Configure PHP-FPM to work with nginx
+          sed -i 's/user = apache/user = nginx/g' /etc/php-fpm.d/www.conf
+          sed -i 's/group = apache/group = nginx/g' /etc/php-fpm.d/www.conf
+          sed -i 's/;listen.owner = nobody/listen.owner = nginx/g' /etc/php-fpm.d/www.conf
+          sed -i 's/;listen.group = nobody/listen.group = nginx/g' /etc/php-fpm.d/www.conf
+          sed -i 's/;listen.mode = 0660/listen.mode = 0660/g' /etc/php-fpm.d/www.conf
+          
+          # Make sure PHP-FPM is listening on the correct socket
+          sed -i 's|listen = 127.0.0.1:9000|listen = /run/php-fpm/www.sock|g' /etc/php-fpm.d/www.conf
+          
+          # Configure PHP-FPM to send error logs to Nginx error log
+          echo "php_admin_value[error_log] = /var/log/nginx/error.log" >> /etc/php-fpm.d/www.conf
+          echo "php_admin_flag[log_errors] = on" >> /etc/php-fpm.d/www.conf
+          
+          # Make sure Nginx log directory has proper permissions
+          mkdir -p /var/log/nginx
+          chown -R nginx:nginx /var/log/nginx
+          chmod -R 755 /var/log/nginx
+          
+          # Create necessary directories for nginx
+          mkdir -p /usr/share/nginx/html
+          
+          # Now run cfn-init to configure the rest (files and CloudWatch agent)
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServerInstance --configsets default --region ${AWS::Region}
+          
+          # Create PHP-FPM socket directory with proper permissions
+          mkdir -p /run/php-fpm
+          chown -R nginx:nginx /run/php-fpm
+          
+          # Start services after configuration
+          systemctl enable php-fpm
+          systemctl start php-fpm
+          
+          # Fix socket file permissions if needed
+          if [ -S /run/php-fpm/www.sock ]; then
+            chown nginx:nginx /run/php-fpm/www.sock
+          fi
+          
+          # Remove default nginx config and start nginx
+          rm -f /etc/nginx/conf.d/default.conf
+          systemctl enable nginx
+          systemctl start nginx
+          
+          # Verify services are running
+          systemctl status php-fpm
+          systemctl status nginx
+          ls -la /run/php-fpm/
+          
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource WebServerInstance --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - install_files
+            - install_cloudwatch_agent
+        install_files:
+          files:
+            /usr/share/nginx/html/index.html:
+              content: |
+                <!DOCTYPE html>
+                <html>
+                <head>
+                  <title>Nginx PHP Sample App</title>
+                  <style>
+                    body {
+                      font-family: Arial, sans-serif;
+                      margin: 0;
+                      padding: 40px;
+                      background-color: #f5f5f5;
+                      color: #333;
+                      text-align: center;
+                    }
+                    .container {
+                      max-width: 800px;
+                      margin: 0 auto;
+                      background-color: white;
+                      padding: 30px;
+                      border-radius: 8px;
+                      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                    }
+                    h1 {
+                      color: #0066cc;
+                    }
+                    .button {
+                      display: inline-block;
+                      background-color: #0066cc;
+                      color: white;
+                      padding: 10px 20px;
+                      margin: 10px;
+                      border-radius: 5px;
+                      text-decoration: none;
+                      font-weight: bold;
+                    }
+                  </style>
+                </head>
+                <body>
+                  <div class="container">
+                    <h1>Welcome to Nginx PHP Sample App</h1>
+                    <p>This page is served by an EC2 instance behind an Application Load Balancer.</p>
+                    <p>Instance ID: <strong>$(curl -s http://169.254.169.254/latest/meta-data/instance-id)</strong></p>
+                    <p>Availability Zone: <strong>$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)</strong></p>
+                    <p>Current Time: <strong>$(date)</strong></p>
+                    <div>
+                      <a href="/cpu_load.php?load=5&duration=10" class="button">Run CPU Load Test (Light)</a>
+                      <a href="/cpu_load.php?load=10&duration=20" class="button">Run CPU Load Test (Heavy)</a>
+                    </div>
+                  </div>
+                </body>
+                </html>
+              mode: '000644'
+              owner: root
+              group: root
+            /usr/share/nginx/html/cpu_load.php:
+              content: |
+                <?php
+                // Configure error logging to go to the system logger (which Nginx can capture)
+                ini_set('log_errors', 1);
+                ini_set('error_log', 'syslog');
+
+                // Set unlimited execution time
+                set_time_limit(0);
+
+                // Get the load level from query parameter (1-15, default 8)
+                $load = isset($_GET['load']) ? intval($_GET['load']) : 8;
+                $load = max(1, min(15, $load)); // Increased max load to 15
+
+                // Get duration from query parameter (in seconds, default 15)
+                $duration = isset($_GET['duration']) ? intval($_GET['duration']) : 15;
+                $duration = max(1, min(120, $duration)); // Increased max duration to 120 seconds
+
+                // Calculate end time
+                $endTime = time() + $duration;
+
+                // Always log a specific error to Nginx error logs
+                error_log("PHP Fatal error: Uncaught Exception: Simulated fatal error in CPU load script", 0);
+
+                // Send a 503 Service Unavailable status - this will be logged by Nginx
+                http_response_code(503);
+
+                header('Content-Type: text/plain');
+                echo "Starting INTENSIVE CPU load test (level: $load, duration: $duration seconds)\n";
+                echo "Note: This script always generates a 503 Service Unavailable error in Nginx logs\n";
+                flush();
+
+                // Recursive factorial function to add more CPU load
+                function calculateFactorial($n) {
+                    if ($n <= 1) {
+                        return 1;
+                    }
+                    return $n * calculateFactorial($n - 1);
+                }
+
+                // Fibonacci calculation - very CPU intensive when recursive
+                function fibonacci($n) {
+                    if ($n <= 1) {
+                        return $n;
+                    }
+                    return fibonacci($n - 1) + fibonacci($n - 2);
+                }
+
+                // Function to consume CPU - enhanced for higher CPU utilization
+                function consumeCPU($complexity) {
+                    $result = 0;
+                    $iterations = 200000 * $complexity; // Increased base iterations
+
+                    // Create a large array to work with
+                    $largeArray = array();
+                    for ($i = 0; $i < 10000; $i++) {
+                        $largeArray[] = mt_rand(1, 10000);
+                    }
+
+                    // Multiple nested loops for higher CPU usage
+                    for ($i = 0; $i < $iterations; $i++) {
+                        // Trigonometric operations are CPU intensive
+                        $result += sin($i) * cos($i) * tan($i);
+
+                        // More frequent prime number calculations
+                        if ($i % 500 == 0) {
+                            $isPrime = true;
+                            $num = $i + 1;
+                            for ($j = 2; $j <= sqrt($num); $j++) {
+                                if ($num % $j == 0) {
+                                    $isPrime = false;
+                                    break;
+                                }
+                            }
+
+                            // Add recursive calculation for even more CPU load
+                            if ($isPrime) {
+                                $result += calculateFactorial(min(10, $complexity));
+                            }
+                        }
+
+                        // Array operations (sorting, searching) are CPU intensive
+                        if ($i % 5000 == 0) {
+                            shuffle($largeArray);
+                            sort($largeArray);
+                            array_search(mt_rand(1, 10000), $largeArray);
+                        }
+
+                        // String operations
+                        if ($i % 7500 == 0) {
+                            $str = str_repeat("CPU load test string ", 1000);
+                            $str = md5($str . microtime());
+                        }
+                    }
+                    return $result;
+                }
+
+                // Run the CPU-intensive loop until duration is reached
+                $cycles = 0;
+                $totalOperations = 0;
+
+                // Create multiple parallel workloads
+                $workloads = min(4, $load); // Use up to 4 parallel workloads based on load level
+
+                while (time() < $endTime) {
+                    // Run multiple workloads to maximize CPU usage
+                    for ($w = 0; $w < $workloads; $w++) {
+                        $result = consumeCPU($load);
+                        $totalOperations += $result;
+                    }
+
+                    // Calculate a small Fibonacci number occasionally (very CPU intensive)
+                    if ($cycles % 3 == 0) {
+                        $fib = fibonacci(min(20, $load + 10));
+                        $totalOperations += $fib;
+                    }
+
+                    $cycles++;
+
+                    // Log the same error on each cycle for consistency
+                    error_log("PHP Warning: INTENSIVE CPU load cycle $cycles completed with extreme resource usage", 0);
+
+                    echo "Completed intensive cycle $cycles\n";
+                    flush();
+                }
+
+                echo "INTENSIVE CPU load test completed. Ran $cycles cycles.\n";
+                echo "A 503 Service Unavailable error was logged in Nginx error logs.\n";
+                ?>
+              mode: '000644'
+              owner: root
+              group: root
+            /etc/nginx/conf.d/php.conf:
+              content: |
+                server {
+                    listen       80;
+                    listen       [::]:80;
+                    server_name  _;
+                    root         /usr/share/nginx/html;
+
+                    # PHP processing
+                    location ~ \.php$ {
+                        try_files $uri =404;
+                        fastcgi_pass unix:/run/php-fpm/www.sock;
+                        fastcgi_index index.php;
+                        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                        include fastcgi_params;
+                    }
+
+                    # Error pages
+                    error_page 404 /404.html;
+                    location = /404.html {
+                    }
+
+                    error_page 500 502 503 504 /50x.html;
+                    location = /50x.html {
+                    }
+                }
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              nginx:
+                enabled: true
+                ensureRunning: true
+              php-fpm:
+                enabled: true
+                ensureRunning: true
+        install_cloudwatch_agent:
+          packages:
+            yum:
+              amazon-cloudwatch-agent: []
+          files:
+            /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json:
+              content: |
+                {
+                  "agent": {
+                    "metrics_collection_interval": 60,
+                    "run_as_user": "root"
+                  },
+                  "logs": {
+                    "service.name": "MyShinyNginxApp",
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "file_path": "/var/log/messages",
+                            "log_group_name": "MyShinyNginxApp",
+                            "log_stream_name": "{instance_id}-messages",
+                            "retention_in_days": 14
+                          },
+                          {
+                            "file_path": "/var/log/secure",
+                            "log_group_name": "MyShinyNginxApp",
+                            "log_stream_name": "{instance_id}-secure",
+                            "retention_in_days": 14
+                          },
+                          {
+                            "file_path": "/var/log/nginx/access.log",
+                            "log_group_name": "MyShinyNginxApp",
+                            "log_stream_name": "{instance_id}-nginx-access",
+                            "retention_in_days": 14
+                          },
+                          {
+                            "file_path": "/var/log/nginx/error.log",
+                            "log_group_name": "MyShinyNginxApp",
+                            "log_stream_name": "{instance_id}-nginx-error",
+                            "retention_in_days": 14
+                          },
+                          {
+                            "file_path": "/var/log/php-fpm/www-error.log",
+                            "log_group_name": "MyShinyNginxApp",
+                            "log_stream_name": "{instance_id}-php-fpm-error",
+                            "retention_in_days": 14
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "metrics": {
+                    "metrics_collected": {
+                      "mem": {
+                        "measurement": [
+                          "mem_used_percent"
+                        ]
+                      },
+                      "disk": {
+                        "measurement": [
+                          "used_percent"
+                        ],
+                        "resources": [
+                          "/"
+                        ]
+                      },
+                      "cpu": {
+                        "totalcpu": true,
+                        "measurement": [
+                          "cpu_usage_idle",
+                          "cpu_usage_user",
+                          "cpu_usage_system"
+                        ]
+                      }
+                    },
+                    "append_dimensions": {
+                      "InstanceId": "${aws:InstanceId}"
+                    }
+                  }
+                }
+              mode: '000644'
+              owner: root
+              group: root
+          commands:
+            start_cloudwatch_agent:
+              command: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-WebServer
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ALB
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref VPC
+      Targets:
+        - Id: !Ref WebServerInstance
+          Port: 80
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # IAM Resources
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebServerRole
+
+  # Lambda Function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 10
+      Environment:
+        Variables:
+          ALB_DNS_NAME: !GetAtt ApplicationLoadBalancer.DNSName
+      Code:
+        ZipFile: |
+          const https = require('https');
+          const http = require('http');
+
+          exports.handler = async (event) => {
+              // Get the ALB DNS name from environment variable that will be set during deployment
+              const url = process.env.ALB_DNS_NAME;
+              console.log(`Calling ALB at: http://${url}`);
+
+              try {
+                  const response = await httpGet(`http://${url}`);
+                  console.log(`Response status code: ${response.statusCode}`);
+                  console.log(`Response body length: ${response.body ? response.body.length : 0} bytes`);
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({
+                          message: 'ALB called successfully',
+                          statusCode: response.statusCode,
+                          timestamp: new Date().toISOString()
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error calling ALB:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({
+                          message: 'Error calling ALB',
+                          error: error.message,
+                          timestamp: new Date().toISOString()
+                      })
+                  };
+              }
+          };
+
+          function httpGet(url) {
+              return new Promise((resolve, reject) => {
+                  const client = url.startsWith('https') ? https : http;
+
+                  const request = client.get(url, (response) => {
+                      if (response.statusCode < 200 || response.statusCode >= 300) {
+                          return reject(new Error(`HTTP status code ${response.statusCode}`));
+                      }
+
+                      const body = [];
+                      response.on('data', (chunk) => body.push(chunk));
+                      response.on('end', () => {
+                          resolve({
+                              statusCode: response.statusCode,
+                              body: Buffer.concat(body).toString()
+                          });
+                      });
+                  });
+
+                  request.on('error', (err) => reject(err));
+                  request.end();
+              });
+          }
+  LambdaScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Schedule to trigger Lambda function every minute"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "LambdaTarget"
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt LambdaScheduleRule.Arn
+
+  # CloudWatch Monitoring Resources
+  NotFoundMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref MyShinyNginxAppLogGroup
+      FilterName: notfound
+      FilterPattern: '"2: No such file or directory"'
+      MetricTransformations:
+        - MetricName: MyShinyNginxApp-404
+          MetricNamespace: MyShinyNginxApp
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  PhpErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref MyShinyNginxAppLogGroup
+      FilterName: php-error
+      FilterPattern: '"Simulated fatal error in CPU load script"'
+      MetricTransformations:
+        - MetricName: 503
+          MetricNamespace: MyShinyNginxApp
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  # SNS Topic for Alarms
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: MyShinyNginxApp Alarms
+      TopicName: MyShinyNginxApp
+
+  NotFoundAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: MyShinyNginxApp-404
+      AlarmDescription: Alarm when too many 404 errors occur
+      MetricName: MyShinyNginxApp-404
+      Namespace: MyShinyNginxApp
+      Statistic: SampleCount
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref NotFoundErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+  PhpErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: MyShinyNginxApp-503
+      AlarmDescription: Alarm when too many PHP errors occur
+      MetricName: 503
+      Namespace: MyShinyNginxApp
+      Statistic: SampleCount
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref PhpErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  # AIOps Investigations are now managed outside of this template
+
+Outputs:
+  WebsiteURL:
+    Description: URL for the ALB
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+
+  CPULoadTestURL:
+    Description: URL for the CPU Load Test
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}/cpu_load.php
+
+  WebServerInstanceId:
+    Description: Instance ID of the web server
+    Value: !Ref WebServerInstance
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+
+  LogGroupName:
+    Description: Name of the CloudWatch Log Group
+    Value: !Ref MyShinyNginxAppLogGroup
+
+  LogGroupArn:
+    Description: ARN of the CloudWatch Log Group
+    Value: !GetAtt MyShinyNginxAppLogGroup.Arn
+
+  MetricFilterName:
+    Description: Name of the 404 Metric Filter
+    Value: !Ref NotFoundMetricFilter
+
+  PhpErrorMetricFilterName:
+    Description: Name of the PHP Error Metric Filter
+    Value: !Ref PhpErrorMetricFilter
+
+  NotFoundAlarmName:
+    Description: Name of the 404 CloudWatch Alarm
+    Value: !Ref NotFoundAlarm
+
+  PhpErrorAlarmName:
+    Description: Name of the PHP Error CloudWatch Alarm
+    Value: !Ref PhpErrorAlarm
+
+  SNSTopicArn:
+    Description: ARN of the SNS Topic for alarms
+    Value: !Ref AlarmNotificationTopic
+
+  # AIOps Investigation ARNs are no longer output since investigations are managed outside this template
